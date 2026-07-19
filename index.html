@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>Geoportal Riesgo de Inundación - San Cristóbal</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Arial, sans-serif; margin: 0; background: #f4f6f8; }
+  header { background: #1F4E78; color: white; padding: 14px 20px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: 0.85; }
+  .layout { display: flex; height: calc(100vh - 64px); }
+  #panel { width: 280px; background: white; padding: 14px; overflow-y: auto; border-right: 1px solid #ddd; }
+  #map { flex: 1; }
+  .section { margin-bottom: 18px; }
+  .section h3 { font-size: 14px; margin: 0 0 8px; color: #1F4E78; border-bottom: 1px solid #eee; padding-bottom: 4px; }
+  label { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-bottom: 6px; cursor: pointer; }
+  select, button { width: 100%; padding: 6px; font-size: 13px; margin-top: 4px; }
+  button { background: #1F4E78; color: white; border: none; border-radius: 4px; padding: 8px; cursor: pointer; }
+  button:hover { background: #2E75B6; }
+  #stats { font-size: 12px; background: #f4f6f8; padding: 8px; border-radius: 4px; line-height: 1.6; }
+  #estado { font-size: 12px; color: #555; min-height: 16px; }
+  .swatch { width: 12px; height: 12px; display: inline-block; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🌊 Geoportal de Riesgo de Inundación — San Cristóbal, Galápagos</h1>
+  <p>Visualización de datos geoespaciales PostGIS alojados en Supabase</p>
+</header>
+
+<div class="layout">
+  <div id="panel">
+
+    <div class="section">
+      <h3>Capas</h3>
+      <label><input type="checkbox" data-layer="zona_inundacion" checked> <span class="swatch" style="background:#E31A1C"></span> Zonas de inundación</label>
+      <label><input type="checkbox" data-layer="scy_riesgos_vias" checked> <span class="swatch" style="background:#3388ff"></span> Vías</label>
+      <label><input type="checkbox" data-layer="scy__riesgos_lugares" checked> <span class="swatch" style="background:#ff7800"></span> Lugares</label>
+      <label><input type="checkbox" data-layer="scy_riesgos_poly" checked> <span class="swatch" style="background:#8e44ad"></span> Edificaciones</label>
+      <label><input type="checkbox" data-layer="parroquias_scy" checked> <span class="swatch" style="background:#2c3e50"></span> Límites parroquiales</label>
+    </div>
+
+    <div class="section">
+      <h3>Consulta por nivel de riesgo</h3>
+      <select id="filtroRiesgo">
+        <option value="">Mostrar todos</option>
+        <option value="ALTO">Solo ALTO</option>
+        <option value="MEDIO">Solo MEDIO</option>
+      </select>
+      <button onclick="aplicarFiltroRiesgo()">Consultar</button>
+    </div>
+
+    <div class="section">
+      <h3>Estadísticas</h3>
+      <div id="stats">Cargando datos…</div>
+    </div>
+
+    <div class="section">
+      <p id="estado"></p>
+    </div>
+
+  </div>
+
+  <div id="map"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  const SUPABASE_URL = "https://dxtwlabptqfljrfdywox.supabase.co/rest/v1/";
+  const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR4dHdsYWJwdHFmbGpyZmR5d294Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODExMzQ4NjMsImV4cCI6MjA5NjcxMDg2M30.U5wVj1fgqFVAZ4Zn_7pbIHLR6PIUGOu1l25kKRwQez0";
+
+  const ESTILOS = {
+    zona_inundacion:      { color: "#800000", fillColor: "#E31A1C", weight: 1, fillOpacity: 0.5 },
+    scy_riesgos_vias:      { color: "#3388ff", weight: 2 },
+    scy_riesgos_poly:      { color: "#8e44ad", fillColor: "#8e44ad", weight: 1, fillOpacity: 0.4 },
+    parroquias_scy:        { color: "#2c3e50", weight: 1.5, fillOpacity: 0 },
+  };
+  const COLOR_PUNTO = { zona_inundacion: null, scy__riesgos_lugares: "#ff7800" };
+
+  const mapa = L.map('map').setView([-0.9, -89.6], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(mapa);
+
+  const capasLeaflet = {};   // nombre_tabla -> L.geoJSON layer
+  const datosCache = {};     // nombre_tabla -> array de filas
+
+  function obtenerGeometria(valor) {
+    if (!valor) return null;
+    if (typeof valor === "object" && valor.type && valor.coordinates) return valor;
+    return null;
+  }
+
+  function popupTexto(fila) {
+    const campos = Object.entries(fila)
+      .filter(([k]) => k !== "geom")
+      .map(([k, v]) => `<b>${k}:</b> ${v !== null ? v : "-"}`)
+      .join("<br>");
+    return `<div style="font-size:12px; max-width:220px;">${campos}</div>`;
+  }
+
+  async function cargarCapa(tabla) {
+    const res = await fetch(SUPABASE_URL + tabla + "?select=*", {
+      headers: { apikey: ANON_KEY, Authorization: "Bearer " + ANON_KEY }
+    });
+    if (!res.ok) throw new Error(tabla + ": HTTP " + res.status);
+    const datos = await res.json();
+    datosCache[tabla] = datos;
+
+    const capa = L.geoJSON([], {
+      style: () => ESTILOS[tabla] || {},
+      pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
+        radius: 5, color: "#333", weight: 1,
+        fillColor: COLOR_PUNTO[tabla] || "#ff7800", fillOpacity: 0.9
+      }),
+      onEachFeature: (feature, layer) => layer.bindPopup(popupTexto(feature.properties))
+    });
+
+    datos.forEach(fila => {
+      const geom = obtenerGeometria(fila.geom);
+      if (geom) capa.addData({ type: "Feature", geometry: geom, properties: fila });
+    });
+
+    capa.addTo(mapa);
+    capasLeaflet[tabla] = capa;
+    return datos.length;
+  }
+
+  async function cargarTodo() {
+    const estado = document.getElementById("estado");
+    const tablas = ["zona_inundacion", "scy_riesgos_vias", "scy__riesgos_lugares", "scy_riesgos_poly", "parroquias_scy"];
+    let resumen = [];
+    for (const t of tablas) {
+      try {
+        const n = await cargarCapa(t);
+        resumen.push(`${t}: ${n}`);
+      } catch (e) {
+        resumen.push(`${t}: ERROR`);
+      }
+    }
+    document.getElementById("stats").innerHTML = resumen.map(r => {
+      const [tabla, n] = r.split(": ");
+      return `<div>${tabla}: <b>${n}</b> registros</div>`;
+    }).join("");
+    estado.innerText = "Datos cargados correctamente.";
+
+    // Ajustar vista a todas las capas cargadas
+    const grupo = L.featureGroup(Object.values(capasLeaflet));
+    if (grupo.getLayers().length > 0) mapa.fitBounds(grupo.getBounds(), { padding: [20, 20] });
+  }
+
+  // Checkboxes: mostrar/ocultar capas
+  document.querySelectorAll('input[data-layer]').forEach(chk => {
+    chk.addEventListener('change', () => {
+      const capa = capasLeaflet[chk.dataset.layer];
+      if (!capa) return;
+      if (chk.checked) mapa.addLayer(capa); else mapa.removeLayer(capa);
+    });
+  });
+
+  // Herramienta de consulta: filtrar zona_inundacion por nivel de riesgo
+  async function aplicarFiltroRiesgo() {
+    const nivel = document.getElementById("filtroRiesgo").value;
+    const estado = document.getElementById("estado");
+    estado.innerText = "Consultando...";
+
+    const url = SUPABASE_URL + "zona_inundacion?select=*" + (nivel ? `&nivel_rsgo=eq.${nivel}` : "");
+    const res = await fetch(url, { headers: { apikey: ANON_KEY, Authorization: "Bearer " + ANON_KEY } });
+    const datos = await res.json();
+
+    if (capasLeaflet["zona_inundacion"]) mapa.removeLayer(capasLeaflet["zona_inundacion"]);
+    const capa = L.geoJSON([], {
+      style: () => ESTILOS["zona_inundacion"],
+      onEachFeature: (f, l) => l.bindPopup(popupTexto(f.properties))
+    });
+    datos.forEach(fila => {
+      const geom = obtenerGeometria(fila.geom);
+      if (geom) capa.addData({ type: "Feature", geometry: geom, properties: fila });
+    });
+    capa.addTo(mapa);
+    capasLeaflet["zona_inundacion"] = capa;
+
+    estado.innerText = `Consulta aplicada: ${datos.length} zona(s) ${nivel ? "de nivel " + nivel : "(todas)"}.`;
+    if (datos.length > 0) {
+      const grupo = L.featureGroup([capa]);
+      mapa.fitBounds(grupo.getBounds(), { padding: [20, 20] });
+    }
+  }
+
+  cargarTodo();
+</script>
+
+</body>
+</html>
