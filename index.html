@@ -117,6 +117,24 @@
     return null;
   }
 
+  // Calcula el centroide aproximado (promedio de vértices) del anillo exterior
+  // de un Polygon o MultiPolygon. Devuelve [lon, lat] o null.
+  function centroideDeGeometria(geometria) {
+    if (!geometria) return null;
+    let anillo = null;
+    if (geometria.type === "Polygon") {
+      anillo = geometria.coordinates[0];
+    } else if (geometria.type === "MultiPolygon") {
+      // usa el anillo exterior del primer polígono (aproximación suficiente para este filtro)
+      anillo = geometria.coordinates[0][0];
+    } else {
+      return null;
+    }
+    let sumLon = 0, sumLat = 0;
+    anillo.forEach(([lon, lat]) => { sumLon += lon; sumLat += lat; });
+    return [sumLon / anillo.length, sumLat / anillo.length];
+  }
+
   function popupTexto(fila) {
     const campos = Object.entries(fila)
       .filter(([k]) => k !== "geom")
@@ -143,6 +161,21 @@
         return zonas.some(z => {
           const geomZona = obtenerGeometria(z.geom);
           return geomZona && puntoEnGeometria([lon, lat], geomZona);
+        });
+      });
+    }
+
+    // La capa de "Edificaciones" se filtra igual: solo se muestran las que
+    // caen dentro de alguna zona de riesgo (se usa el centroide del polígono)
+    if (tabla === "scy_riesgos_poly") {
+      const zonas = datosCache["zona_inundacion"] || [];
+      datos = datos.filter(fila => {
+        const geomEdif = obtenerGeometria(fila.geom);
+        const centroide = centroideDeGeometria(geomEdif);
+        if (!centroide) return false;
+        return zonas.some(z => {
+          const geomZona = obtenerGeometria(z.geom);
+          return geomZona && puntoEnGeometria(centroide, geomZona);
         });
       });
     }
