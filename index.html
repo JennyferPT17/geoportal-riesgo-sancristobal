@@ -59,6 +59,13 @@
     </div>
 
     <div class="section">
+      <h3>📍 Reporte por mi ubicación</h3>
+      <button onclick="verificarUbicacion()">Usar mi ubicación</button>
+      <div id="resultadoUbicacion" style="margin-top:8px; font-size:12px;"></div>
+      <button id="btnDescargarReporte" onclick="descargarReporte()" style="display:none; margin-top:6px; background:#555;">Descargar reporte</button>
+    </div>
+
+    <div class="section">
       <p id="estado"></p>
     </div>
 
@@ -189,6 +196,170 @@
   }
 
   cargarTodo();
+
+  // ===================== REPORTE POR UBICACIÓN =====================
+
+  let ultimoReporte = null;      // guarda los datos del último chequeo para el botón de descarga
+  let marcadorUsuario = null;    // marcador de la ubicación del usuario en el mapa
+  let circuloRadio = null;
+
+  // Algoritmo ray-casting: determina si un punto [lon,lat] está dentro de un anillo de un polígono
+  function puntoEnAnillo(punto, anillo) {
+    const [x, y] = punto;
+    let dentro = false;
+    for (let i = 0, j = anillo.length - 1; i < anillo.length; j = i++) {
+      const [xi, yi] = anillo[i];
+      const [xj, yj] = anillo[j];
+      const interseca = ((yi > y) !== (yj > y)) &&
+        (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+      if (interseca) dentro = !dentro;
+    }
+    return dentro;
+  }
+
+  // Verifica si un punto [lon,lat] está dentro de una geometría Polygon o MultiPolygon
+  function puntoEnGeometria(punto, geometria) {
+    if (!geometria) return false;
+    if (geometria.type === "Polygon") {
+      // El primer anillo es el exterior; los siguientes son huecos
+      if (!puntoEnAnillo(punto, geometria.coordinates[0])) return false;
+      for (let i = 1; i < geometria.coordinates.length; i++) {
+        if (puntoEnAnillo(punto, geometria.coordinates[i])) return false; // está en un hueco
+      }
+      return true;
+    }
+    if (geometria.type === "MultiPolygon") {
+      return geometria.coordinates.some(poligono => {
+        if (!puntoEnAnillo(punto, poligono[0])) return false;
+        for (let i = 1; i < poligono.length; i++) {
+          if (puntoEnAnillo(punto, poligono[i])) return false;
+        }
+        return true;
+      });
+    }
+    return false;
+  }
+
+  // Distancia aproximada (m) de un punto a los vértices de una geometría (para saber "qué tan cerca" si no está dentro)
+  function distanciaAproximadaM(lat, lon, geometria) {
+    const R = 6371000;
+    function hav(lat1, lon1, lat2, lon2) {
+      const toRad = d => d * Math.PI / 180;
+      const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+      return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+    let min = Infinity;
+    const anillos = geometria.type === "Polygon" ? [geometria.coordinates[0]]
+      : geometria.type === "MultiPolygon" ? geometria.coordinates.map(pg => pg[0]) : [];
+    anillos.forEach(anillo => {
+      anillo.forEach(([lon2, lat2]) => {
+        const d = hav(lat, lon, lat2, lon2);
+        if (d < min) min = d;
+      });
+    });
+    return min;
+  }
+
+  function verificarUbicacion() {
+    const resultado = document.getElementById("resultadoUbicacion");
+    if (!navigator.geolocation) {
+      resultado.innerHTML = "Tu navegador no soporta geolocalización.";
+      return;
+    }
+    resultado.innerHTML = "Obteniendo tu ubicación…";
+
+    navigator.geolocation.getCurrentPosition(pos => {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      const zonas = datosCache["zona_inundacion"] || [];
+
+      // Marcar al usuario en el mapa
+      if (marcadorUsuario) mapa.removeLayer(marcadorUsuario);
+      marcadorUsuario = L.marker([lat, lon], {
+        icon: L.divIcon({ className: '', html: '📍', iconSize: [24, 24] })
+      }).addTo(mapa).bindPopup("Tu ubicación").openPopup();
+      mapa.setView([lat, lon], 15);
+
+      // Verificar si está dentro de alguna zona de riesgo
+      let zonaEncontrada = null;
+      for (const fila of zonas) {
+        const geom = obtenerGeometria(fila.geom);
+        if (geom && puntoEnGeometria([lon, lat], geom)) {
+          zonaEncontrada = fila;
+          break;
+        }
+      }
+
+      let mensaje, nivel, distancia = null;
+      if (zonaEncontrada) {
+        nivel = zonaEncontrada.nivel_rsgo;
+        const color = nivel === "ALTO" ? "#E31A1C" : "#FFA500";
+        mensaje = `<div style="padding:8px; background:${color}22; border-left:4px solid ${color};">
+          ⚠️ <b>Estás dentro de una zona de riesgo ${nivel}</b></div>`;
+      } else {
+        // Buscar distancia a la zona ALTO más cercana
+        let minDist = Infinity;
+        zonas.forEach(fila => {
+          if (fila.nivel_rsgo === "ALTO") {
+            const geom = obtenerGeometria(fila.geom);
+            if (geom) {
+              const d = distanciaAproximadaM(lat, lon, geom);
+              if (d < minDist) minDist = d;
+            }
+          }
+        });
+        distancia = minDist;
+        nivel = "FUERA DE ZONA DE RIESGO";
+        mensaje = `<div style="padding:8px; background:#2ecc7122; border-left:4px solid #2ecc71;">
+          ✅ <b>No estás dentro de una zona de riesgo mapeada</b><br>
+          Zona ALTO más cercana: ~${Math.round(minDist)} m</div>`;
+      }
+
+      resultado.innerHTML = mensaje;
+
+      ultimoReporte = {
+        fecha: new Date().toLocaleString('es-EC'),
+        lat: lat.toFixed(6),
+        lon: lon.toFixed(6),
+        precision: Math.round(pos.coords.accuracy) + " m",
+        nivel: nivel,
+        distanciaZonaAlto: distancia !== null ? Math.round(distancia) + " m" : "N/A (ya está dentro)"
+      };
+      document.getElementById("btnDescargarReporte").style.display = "block";
+
+    }, err => {
+      resultado.innerHTML = "No se pudo obtener tu ubicación: " + err.message +
+        "<br><small>Verifica que hayas dado permiso de ubicación al navegador.</small>";
+    }, { enableHighAccuracy: true, timeout: 10000 });
+  }
+
+  function descargarReporte() {
+    if (!ultimoReporte) return;
+    const r = ultimoReporte;
+    const texto =
+`REPORTE DE RIESGO DE INUNDACIÓN — SAN CRISTÓBAL, GALÁPAGOS
+============================================================
+Fecha y hora de generación : ${r.fecha}
+Coordenadas (lat, lon)     : ${r.lat}, ${r.lon}
+Precisión del GPS          : ${r.precision}
+Nivel de riesgo detectado  : ${r.nivel}
+Distancia a zona ALTO      : ${r.distanciaZonaAlto}
+------------------------------------------------------------
+Este reporte fue generado automáticamente por el Geoportal
+de Riesgo de Inundación de San Cristóbal, a partir de la
+ubicación GPS del dispositivo y las zonas de riesgo
+almacenadas en la base de datos PostGIS (tabla zona_inundacion).
+============================================================`;
+
+    const blob = new Blob([texto], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `reporte_riesgo_${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
 </script>
 
 </body>
