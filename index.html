@@ -62,7 +62,7 @@
       <h3>📍 Reporte por mi ubicación</h3>
       <button onclick="verificarUbicacion()">Usar mi ubicación</button>
       <div id="resultadoUbicacion" style="margin-top:8px; font-size:12px;"></div>
-      <button id="btnDescargarReporte" onclick="descargarReporte()" style="display:none; margin-top:6px; background:#555;">Descargar reporte</button>
+      <button id="btnDescargarReporte" onclick="descargarReportePDF()" style="display:none; margin-top:6px; background:#555;">Descargar reporte (PDF)</button>
     </div>
 
     <div class="section">
@@ -75,6 +75,7 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script>
   const SUPABASE_URL = "https://dxtwlabptqfljrfdywox.supabase.co/rest/v1/";
   const ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR4dHdsYWJwdHFmbGpyZmR5d294Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODExMzQ4NjMsImV4cCI6MjA5NjcxMDg2M30.U5wVj1fgqFVAZ4Zn_7pbIHLR6PIUGOu1l25kKRwQez0";
@@ -86,6 +87,21 @@
     parroquias_scy:        { color: "#2c3e50", weight: 1.5, fillOpacity: 0 },
   };
   const COLOR_PUNTO = { zona_inundacion: null, scy__riesgos_lugares: "#ff7800" };
+
+  // Devuelve el estilo correcto según la tabla y, para zona_inundacion, según su nivel de riesgo
+  function estiloParaFeature(tabla, feature) {
+    if (tabla === "zona_inundacion") {
+      const nivel = feature && feature.properties && feature.properties.nivel_rsgo;
+      if (nivel === "ALTO") {
+        return { color: "#800000", fillColor: "#E31A1C", weight: 1, fillOpacity: 0.5 };
+      }
+      if (nivel === "MEDIO") {
+        return { color: "#B8860B", fillColor: "#FFD700", weight: 1, fillOpacity: 0.5 };
+      }
+      return { color: "#800000", fillColor: "#E31A1C", weight: 1, fillOpacity: 0.5 }; // por defecto
+    }
+    return ESTILOS[tabla] || {};
+  }
 
   const mapa = L.map('map').setView([-0.9, -89.6], 12);
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(mapa);
@@ -112,11 +128,27 @@
       headers: { apikey: ANON_KEY, Authorization: "Bearer " + ANON_KEY }
     });
     if (!res.ok) throw new Error(tabla + ": HTTP " + res.status);
-    const datos = await res.json();
+    let datos = await res.json();
+
+    // La capa de "Lugares" se filtra para mostrar solo los puntos que caen
+    // dentro de alguna zona de riesgo (evita un mapa disperso/desordenado)
+    if (tabla === "scy__riesgos_lugares") {
+      const zonas = datosCache["zona_inundacion"] || [];
+      datos = datos.filter(fila => {
+        const punto = obtenerGeometria(fila.geom);
+        if (!punto || punto.type !== "Point") return false;
+        const [lon, lat] = punto.coordinates;
+        return zonas.some(z => {
+          const geomZona = obtenerGeometria(z.geom);
+          return geomZona && puntoEnGeometria([lon, lat], geomZona);
+        });
+      });
+    }
+
     datosCache[tabla] = datos;
 
     const capa = L.geoJSON([], {
-      style: () => ESTILOS[tabla] || {},
+      style: (feature) => estiloParaFeature(tabla, feature),
       pointToLayer: (feature, latlng) => L.circleMarker(latlng, {
         radius: 5, color: "#333", weight: 1,
         fillColor: COLOR_PUNTO[tabla] || "#ff7800", fillOpacity: 0.9
@@ -178,7 +210,7 @@
 
     if (capasLeaflet["zona_inundacion"]) mapa.removeLayer(capasLeaflet["zona_inundacion"]);
     const capa = L.geoJSON([], {
-      style: () => ESTILOS["zona_inundacion"],
+      style: (feature) => estiloParaFeature("zona_inundacion", feature),
       onEachFeature: (f, l) => l.bindPopup(popupTexto(f.properties))
     });
     datos.forEach(fila => {
@@ -320,13 +352,16 @@
 
       ultimoReporte = {
         fecha: new Date().toLocaleString('es-EC'),
-        lat: lat.toFixed(6),
-        lon: lon.toFixed(6),
-        precision: Math.round(pos.coords.accuracy) + " m",
+        lat: lat,
+        lon: lon,
+        precision: Math.round(pos.coords.accuracy),
         nivel: nivel,
-        distanciaZonaAlto: distancia !== null ? Math.round(distancia) + " m" : "N/A (ya está dentro)"
+        distanciaZonaAlto: distancia !== null ? Math.round(distancia) : null
       };
       document.getElementById("btnDescargarReporte").style.display = "block";
+
+      // Guardar automáticamente el reporte en Supabase para el administrador
+      guardarReporteEnSupabase(ultimoReporte);
 
     }, err => {
       resultado.innerHTML = "No se pudo obtener tu ubicación: " + err.message +
@@ -334,31 +369,73 @@
     }, { enableHighAccuracy: true, timeout: 10000 });
   }
 
-  function descargarReporte() {
+  // Guarda el reporte en la tabla reportes_ubicacion vía API REST de Supabase (INSERT)
+  async function guardarReporteEnSupabase(r) {
+    try {
+      await fetch(SUPABASE_URL + "reportes_ubicacion", {
+        method: "POST",
+        headers: {
+          apikey: ANON_KEY,
+          Authorization: "Bearer " + ANON_KEY,
+          "Content-Type": "application/json",
+          Prefer: "return=minimal"
+        },
+        body: JSON.stringify({
+          lat: r.lat,
+          lon: r.lon,
+          precision_gps: r.precision,
+          nivel_riesgo: r.nivel,
+          distancia_zona_alto_m: r.distanciaZonaAlto
+        })
+      });
+    } catch (e) {
+      console.error("No se pudo guardar el reporte en Supabase:", e);
+    }
+  }
+
+  // Genera un PDF descargable con jsPDF a partir del último reporte generado
+  function descargarReportePDF() {
     if (!ultimoReporte) return;
     const r = ultimoReporte;
-    const texto =
-`REPORTE DE RIESGO DE INUNDACIÓN — SAN CRISTÓBAL, GALÁPAGOS
-============================================================
-Fecha y hora de generación : ${r.fecha}
-Coordenadas (lat, lon)     : ${r.lat}, ${r.lon}
-Precisión del GPS          : ${r.precision}
-Nivel de riesgo detectado  : ${r.nivel}
-Distancia a zona ALTO      : ${r.distanciaZonaAlto}
-------------------------------------------------------------
-Este reporte fue generado automáticamente por el Geoportal
-de Riesgo de Inundación de San Cristóbal, a partir de la
-ubicación GPS del dispositivo y las zonas de riesgo
-almacenadas en la base de datos PostGIS (tabla zona_inundacion).
-============================================================`;
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF();
 
-    const blob = new Blob([texto], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `reporte_riesgo_${Date.now()}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
+    doc.setFontSize(14);
+    doc.setFont(undefined, "bold");
+    doc.text("Reporte de Riesgo de Inundación", 15, 20);
+    doc.text("San Cristóbal, Galápagos", 15, 28);
+
+    doc.setDrawColor(31, 78, 120);
+    doc.line(15, 32, 195, 32);
+
+    doc.setFontSize(11);
+    doc.setFont(undefined, "normal");
+    let y = 44;
+    const filas = [
+      ["Fecha y hora de generación", r.fecha],
+      ["Coordenadas (lat, lon)", `${r.lat.toFixed(6)}, ${r.lon.toFixed(6)}`],
+      ["Precisión del GPS", `${r.precision} m`],
+      ["Nivel de riesgo detectado", r.nivel],
+      ["Distancia a zona ALTO", r.distanciaZonaAlto !== null ? `${r.distanciaZonaAlto} m` : "N/A (ya está dentro)"],
+    ];
+    filas.forEach(([label, val]) => {
+      doc.setFont(undefined, "bold");
+      doc.text(label + ":", 15, y);
+      doc.setFont(undefined, "normal");
+      doc.text(String(val), 90, y);
+      y += 9;
+    });
+
+    y += 6;
+    doc.setFontSize(9);
+    doc.setTextColor(100);
+    const nota = "Este reporte fue generado automáticamente por el Geoportal de Riesgo de Inundación de " +
+      "San Cristóbal, a partir de la ubicación GPS del dispositivo y las zonas de riesgo almacenadas en " +
+      "la base de datos PostGIS (tabla zona_inundacion). Una copia de este reporte quedó registrada en el " +
+      "sistema para consulta del administrador.";
+    doc.text(doc.splitTextToSize(nota, 180), 15, y);
+
+    doc.save(`reporte_riesgo_${Date.now()}.pdf`);
   }
 </script>
 
